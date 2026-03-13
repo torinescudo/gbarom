@@ -1,6 +1,7 @@
 #include "global.h"
 #include "multiplayer.h"
 #include "multiplayer_menu.h"
+#include "online_menu.h"
 #include "battle_setup.h"
 #include "bike.h"
 #include "coord_event_weather.h"
@@ -181,6 +182,12 @@ int ProcessPlayerFieldInput(struct FieldInput *input)
     }
     if (input->pressedAButton && TrySetupDiveDownScript() == TRUE)
         return TRUE;
+    if ((gMain.heldKeysRaw & (L_BUTTON | R_BUTTON)) == (L_BUTTON | R_BUTTON))
+    {
+        PlaySE(SE_WIN_OPEN);
+        OnlineMenu_Open();
+        return TRUE;
+    }
     if (input->pressedStartButton)
     {
         PlaySE(SE_WIN_OPEN);
