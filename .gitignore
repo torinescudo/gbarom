@@ -1,0 +1,14 @@
+# Build artifacts
+pokeemerald/build/
+pokeemerald/pokeemerald.elf
+pokeemerald/pokeemerald.map
+pokeemerald/.git/
+
+# agbcc compiler (cloned/built separately)
+agbcc/
+pokeemerald/tools/agbcc/
+
+# System
+*.pyc
+__pycache__/
+.DS_Store

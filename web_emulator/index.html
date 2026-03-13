@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pokémon Emerald Online — GBA Emulator</title>
+<style>
+:root {
+    --lc-bg-dark: #101018;
+    --lc-bg-mid: #1c1c24;
+    --lc-border: #2c2c34;
+    --lc-cyan: #18e0e0;
+    --lc-gold: #e0d020;
+    --lc-text: #eaeae0;
+    --lc-text-dim: #484850;
+    --lc-shadow: #080810;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+    background: var(--lc-bg-dark);
+    color: var(--lc-text);
+    font-family: 'Segoe UI', 'Roboto', monospace;
+    display: flex; flex-direction: column;
+    align-items: center; min-height:100vh;
+}
+h1 {
+    margin: 20px 0 8px;
+    font-size: 1.4rem;
+    color: var(--lc-cyan);
+    text-shadow: 0 0 8px rgba(24,224,224,0.4);
+}
+.subtitle { color: var(--lc-text-dim); font-size: 0.85rem; margin-bottom: 16px; }
+#screen-container {
+    position: relative;
+    border: 2px solid var(--lc-border);
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 0 24px rgba(24,224,224,0.15), inset 0 0 40px rgba(0,0,0,0.5);
+    background: #000;
+}
+canvas#screen {
+    display: block;
+    width: 480px; height: 320px;
+    image-rendering: pixelated;
+}
+.controls {
+    display: flex; gap: 12px; margin: 16px 0; flex-wrap: wrap; justify-content: center;
+}
+.controls button, .controls label, .controls input, .controls select {
+    font-family: inherit; font-size: 0.85rem;
+    background: var(--lc-bg-mid);
+    color: var(--lc-text);
+    border: 1px solid var(--lc-border);
+    border-radius: 4px;
+    padding: 6px 14px;
+    cursor: pointer;
+}
+.controls button:hover { border-color: var(--lc-cyan); color: var(--lc-cyan); }
+.controls input[type=text] { width: 160px; }
+#status-bar {
+    display: flex; gap: 16px; align-items: center;
+    padding: 8px 16px; margin-bottom: 8px;
+    background: var(--lc-bg-mid);
+    border: 1px solid var(--lc-border);
+    border-radius: 6px;
+    font-size: 0.8rem;
+}
+.dot { display:inline-block; width:8px;height:8px;border-radius:50%;margin-right:4px; }
+.dot-off { background:#444; }
+.dot-on  { background:#0c0; }
+.dot-err { background:#c00; }
+#log {
+    width: 480px; max-height: 120px; overflow-y: auto;
+    background: var(--lc-bg-mid);
+    border: 1px solid var(--lc-border);
+    border-radius: 4px;
+    padding: 8px; font-size: 0.75rem;
+    color: var(--lc-text-dim);
+    margin-top: 8px;
+}
+#log .info { color: var(--lc-text); }
+#log .ok   { color: #0c0; }
+#log .err  { color: #f44; }
+</style>
+</head>
+<body>
+
+<h1>Pokémon Emerald Online</h1>
+<p class="subtitle">Retro Liquid Crystal — Multiplayer GBA Emulator</p>
+
+<div id="status-bar">
+    <span>ROM: <span id="rom-status">not loaded</span></span>
+    <span>Server: <span class="dot dot-off" id="ws-dot"></span><span id="ws-status">disconnected</span></span>
+    <span>Room: <span id="room-status">—</span></span>
+    <span>FPS: <span id="fps-counter">0</span></span>
+</div>
+
+<div id="screen-container">
+    <canvas id="screen" width="240" height="160"></canvas>
+</div>
+
+<div class="controls">
+    <label>ROM: <input type="file" id="rom-file" accept=".gba"></label>
+    <label>Server: <input type="text" id="ws-url" value="ws://localhost:8765" placeholder="ws://host:port"></label>
+    <label>Room: <input type="text" id="room-id" value="emerald-1" placeholder="room name"></label>
+    <button id="btn-connect">Connect</button>
+    <button id="btn-disconnect" disabled>Disconnect</button>
+</div>
+
+<div id="log"></div>
+
+<script>
+/**
+ * GBA Online Emulator Shell
+ *
+ * This is the netplay wrapper around an IodineGBA / mGBA.js / gba-emu core.
+ * It handles:
+ *  - ROM loading
+ *  - WebSocket connection to ws_bridge → relay
+ *  - Sending/receiving player_state messages
+ *  - Key input mapping
+ *
+ * The actual GBA emulation core should be loaded as a separate script
+ * (e.g.  IodineGBA's "IodineGBA-master.js" or mgba.js).
+ * For now we provide the full netplay framework with a placeholder
+ * render loop so the UI is functional.
+ */
+
+const $ = s => document.querySelector(s);
+const log = (msg, cls = 'info') => {
+    const el = document.createElement('div');
+    el.className = cls;
+    el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    const logEl = $('#log');
+    logEl.appendChild(el);
+    logEl.scrollTop = logEl.scrollHeight;
+};
+
+/* ── Canvas / placeholder render ─────────────────────── */
+const canvas = $('#screen');
+const ctx = canvas.getContext('2d');
+ctx.fillStyle = '#101018';
+ctx.fillRect(0, 0, 240, 160);
+ctx.fillStyle = '#18e0e0';
+ctx.font = '12px monospace';
+ctx.fillText('Load a .gba ROM to start', 32, 80);
+
+let romLoaded = false;
+let romData = null;
+
+$('#rom-file').addEventListener('change', e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+        romData = new Uint8Array(reader.result);
+        romLoaded = true;
+        $('#rom-status').textContent = file.name;
+        log(`ROM loaded: ${file.name} (${(romData.byteLength / 1024 / 1024).toFixed(1)} MB)`, 'ok');
+        startEmulator(romData);
+    };
+    reader.readAsArrayBuffer(file);
+});
+
+/* ── Emulator core placeholder ───────────────────────── */
+/* Replace this section with actual GBA emulator binding  */
+
+let emuRunning = false;
+let frameCount = 0;
+let lastFpsTime = performance.now();
+
+function startEmulator(rom) {
+    if (emuRunning) return;
+    emuRunning = true;
+    log('Emulator started (placeholder — connect a GBA core for real emulation)');
+
+    /* Placeholder: draw a gradient frame to show canvas works */
+    function renderFrame() {
+        if (!emuRunning) return;
+        frameCount++;
+
+        const now = performance.now();
+        if (now - lastFpsTime >= 1000) {
+            $('#fps-counter').textContent = frameCount;
+            frameCount = 0;
+            lastFpsTime = now;
+        }
+
+        /* Placeholder pixel noise to show the canvas is alive */
+        const img = ctx.createImageData(240, 160);
+        const t = performance.now() / 1000;
+        for (let i = 0; i < img.data.length; i += 4) {
+            const px = (i / 4) % 240;
+            const py = Math.floor((i / 4) / 240);
+            const v = ((Math.sin(px * 0.05 + t) + Math.sin(py * 0.05 + t * 0.7)) * 0.25 + 0.5);
+            img.data[i]   = v * 16;
+            img.data[i+1] = v * 16;
+            img.data[i+2] = v * 24;
+            img.data[i+3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+
+        ctx.fillStyle = '#18e0e0';
+        ctx.font = '10px monospace';
+        ctx.fillText('Placeholder renderer — plug in GBA core', 16, 80);
+        ctx.fillText('Netplay framework active', 48, 96);
+
+        requestAnimationFrame(renderFrame);
+    }
+    requestAnimationFrame(renderFrame);
+}
+
+/* ── Key mapping (standard GBA) ──────────────────────── */
+const keyMap = {
+    'ArrowUp': 'UP', 'ArrowDown': 'DOWN', 'ArrowLeft': 'LEFT', 'ArrowRight': 'RIGHT',
+    'z': 'A', 'x': 'B', 'Enter': 'START', 'Shift': 'SELECT',
+    'a': 'L', 's': 'R',
+};
+let keysPressed = {};
+document.addEventListener('keydown', e => {
+    const k = keyMap[e.key];
+    if (k) { keysPressed[k] = true; e.preventDefault(); }
+});
+document.addEventListener('keyup', e => {
+    const k = keyMap[e.key];
+    if (k) { keysPressed[k] = false; e.preventDefault(); }
+});
+
+/* ── WebSocket Netplay ───────────────────────────────── */
+let ws = null;
+let connected = false;
+let localState = null;
+
+function wsConnect(url, room) {
+    if (ws) wsDisconnect();
+
+    ws = new WebSocket(url);
+    log(`Connecting to ${url}…`);
+
+    ws.onopen = () => {
+        connected = true;
+        $('#ws-dot').className = 'dot dot-on';
+        $('#ws-status').textContent = 'connected';
+        log('WebSocket connected', 'ok');
+
+        wsSend({ type: 'hello', version: '1', name: 'web-player' });
+        wsSend({ type: 'join', room: room });
+    };
+
+    ws.onmessage = (evt) => {
+        let pkt;
+        try { pkt = JSON.parse(evt.data); } catch { return; }
+        handleServerPacket(pkt);
+    };
+
+    ws.onclose = () => {
+        connected = false;
+        $('#ws-dot').className = 'dot dot-off';
+        $('#ws-status').textContent = 'disconnected';
+        log('WebSocket closed');
+    };
+
+    ws.onerror = () => {
+        $('#ws-dot').className = 'dot dot-err';
+        $('#ws-status').textContent = 'error';
+        log('WebSocket error', 'err');
+    };
+}
+
+function wsDisconnect() {
+    if (ws) {
+        ws.close();
+        ws = null;
+    }
+    connected = false;
+    $('#ws-dot').className = 'dot dot-off';
+    $('#ws-status').textContent = 'disconnected';
+    $('#room-status').textContent = '—';
+    $('#btn-connect').disabled = false;
+    $('#btn-disconnect').disabled = true;
+}
+
+function wsSend(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN)
+        ws.send(JSON.stringify(obj));
+}
+
+function handleServerPacket(pkt) {
+    switch (pkt.type) {
+    case 'hello_ack':
+        log(`Authenticated as "${pkt.name}"`, 'ok');
+        break;
+    case 'joined':
+        log(`Joined room "${pkt.room}" as side ${pkt.side}`, 'ok');
+        $('#room-status').textContent = pkt.room;
+        break;
+    case 'start':
+        log(`Match started! Seed: ${pkt.seed}`, 'ok');
+        break;
+    case 'peer_update':
+        log(`Players in room: ${pkt.players.join(', ')}`);
+        break;
+    case 'player_state':
+        handleRemoteState(pkt);
+        break;
+    case 'interact_request':
+        log(`Interaction request: ${pkt.interaction}`, 'info');
+        break;
+    case 'pong':
+        break;
+    case 'error':
+        log(`Server error: ${pkt.code}`, 'err');
+        break;
+    case 'welcome':
+        break;
+    default:
+        log(`Unknown: ${pkt.type}`);
+    }
+}
+
+function handleRemoteState(pkt) {
+    /* In real integration, update remote player sprite on the GBA screen.
+       For now, just log key changes. */
+    if (!localState || pkt.mapGroup !== localState.lastRemoteMap) {
+        log(`Remote player on map (${pkt.mapGroup},${pkt.mapNum}) at (${pkt.x},${pkt.y})`);
+        if (localState) localState.lastRemoteMap = pkt.mapGroup;
+    }
+}
+
+/* Send local state periodically (when real emu is connected) */
+function broadcastLocalState() {
+    if (!connected || !emuRunning) return;
+    /* Placeholder — real integration reads from emulator memory */
+    wsSend({
+        type: 'player_state',
+        mapGroup: 0, mapNum: 0,
+        x: 0, y: 0,
+        facingDirection: 1,
+        movementAction: 0,
+        graphicsId: 0,
+    });
+}
+setInterval(broadcastLocalState, 250);
+
+/* Ping keep-alive */
+setInterval(() => {
+    if (connected) wsSend({ type: 'ping', ts: Date.now() });
+}, 5000);
+
+/* ── UI button handlers ──────────────────────────────── */
+$('#btn-connect').addEventListener('click', () => {
+    const url = $('#ws-url').value.trim();
+    const room = $('#room-id').value.trim();
+    if (!url || !room) { log('Enter server URL and room name', 'err'); return; }
+    wsConnect(url, room);
+    $('#btn-connect').disabled = true;
+    $('#btn-disconnect').disabled = false;
+});
+
+$('#btn-disconnect').addEventListener('click', wsDisconnect);
+
+log('Ready. Load a ROM and connect to play online.');
+</script>
+</body>
+</html>
