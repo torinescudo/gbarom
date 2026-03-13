@@ -109,21 +109,10 @@ canvas#screen {
 
 <div id="log"></div>
 
+<script src="mgba.js"></script>
 <script>
 /**
- * GBA Online Emulator Shell
- *
- * This is the netplay wrapper around an IodineGBA / mGBA.js / gba-emu core.
- * It handles:
- *  - ROM loading
- *  - WebSocket connection to ws_bridge → relay
- *  - Sending/receiving player_state messages
- *  - Key input mapping
- *
- * The actual GBA emulation core should be loaded as a separate script
- * (e.g.  IodineGBA's "IodineGBA-master.js" or mgba.js).
- * For now we provide the full netplay framework with a placeholder
- * render loop so the UI is functional.
+ * GBA Online Emulator — mGBA WASM Core + Netplay
  */
 
 const $ = s => document.querySelector(s);
@@ -136,7 +125,7 @@ const log = (msg, cls = 'info') => {
     logEl.scrollTop = logEl.scrollHeight;
 };
 
-/* ── Canvas / placeholder render ─────────────────────── */
+/* ── Canvas ──────────────────────────────────────────── */
 const canvas = $('#screen');
 const ctx = canvas.getContext('2d');
 ctx.fillStyle = '#101018';
@@ -146,84 +135,174 @@ ctx.font = '12px monospace';
 ctx.fillText('Load a .gba ROM to start', 32, 80);
 
 let romLoaded = false;
-let romData = null;
-
-$('#rom-file').addEventListener('change', e => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-        romData = new Uint8Array(reader.result);
-        romLoaded = true;
-        $('#rom-status').textContent = file.name;
-        log(`ROM loaded: ${file.name} (${(romData.byteLength / 1024 / 1024).toFixed(1)} MB)`, 'ok');
-        startEmulator(romData);
-    };
-    reader.readAsArrayBuffer(file);
-});
-
-/* ── Emulator core placeholder ───────────────────────── */
-/* Replace this section with actual GBA emulator binding  */
-
 let emuRunning = false;
 let frameCount = 0;
 let lastFpsTime = performance.now();
 
-function startEmulator(rom) {
+/* ── mGBA WASM Core ─────────────────────────────────── */
+let mgba = null;        /* Emscripten Module */
+let mgbaCreate, mgbaLoadRom, mgbaReset, mgbaRunFrame, mgbaGetPixels;
+let mgbaSetKeys, mgbaGetWidth, mgbaGetHeight;
+let mgbaRead8, mgbaRead16, mgbaRead32, mgbaWrite8, mgbaWrite16;
+let mgbaFrameCounter, mgbaDestroy;
+
+async function initMGBA() {
+    log('Loading mGBA WASM core…');
+    try {
+        mgba = await createMGBA();
+        mgbaCreate    = mgba.cwrap('mgba_create',        'number', []);
+        mgbaLoadRom   = mgba.cwrap('mgba_load_rom',      'number', ['number','number']);
+        mgbaReset     = mgba.cwrap('mgba_reset',         'number', []);
+        mgbaRunFrame  = mgba.cwrap('mgba_run_frame',      null,    []);
+        mgbaGetPixels = mgba.cwrap('mgba_get_pixels',    'number', []);
+        mgbaSetKeys   = mgba.cwrap('mgba_set_keys',       null,    ['number']);
+        mgbaGetWidth  = mgba.cwrap('mgba_get_width',     'number', []);
+        mgbaGetHeight = mgba.cwrap('mgba_get_height',    'number', []);
+        mgbaRead8     = mgba.cwrap('mgba_read8',         'number', ['number']);
+        mgbaRead16    = mgba.cwrap('mgba_read16',        'number', ['number']);
+        mgbaRead32    = mgba.cwrap('mgba_read32',        'number', ['number']);
+        mgbaWrite8    = mgba.cwrap('mgba_write8',         null,    ['number','number']);
+        mgbaWrite16   = mgba.cwrap('mgba_write16',        null,    ['number','number']);
+        mgbaFrameCounter = mgba.cwrap('mgba_frame_counter','number',[]);
+        mgbaDestroy   = mgba.cwrap('mgba_destroy',        null,    []);
+
+        if (!mgbaCreate()) {
+            log('Failed to create mGBA core', 'err');
+            return false;
+        }
+        log('mGBA core initialized', 'ok');
+        return true;
+    } catch (e) {
+        log(`mGBA init error: ${e.message}`, 'err');
+        return false;
+    }
+}
+
+/* ── ROM Loading ─────────────────────────────────────── */
+$('#rom-file').addEventListener('change', async e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const buf = await file.arrayBuffer();
+    const romBytes = new Uint8Array(buf);
+
+    if (!mgba) {
+        const ok = await initMGBA();
+        if (!ok) return;
+    }
+
+    /* Copy ROM to WASM heap */
+    const ptr = mgba._malloc(romBytes.length);
+    mgba.HEAPU8.set(romBytes, ptr);
+
+    const ok = mgbaLoadRom(ptr, romBytes.length);
+    /* Don't free ptr — mGBA owns the VFile memory now (glue copies it) */
+    mgba._free(ptr);
+
+    if (ok <= 0) {
+        log('Failed to load ROM', 'err');
+        return;
+    }
+
+    if (!mgbaReset()) {
+        log('Failed to reset core after ROM load', 'err');
+        return;
+    }
+
+    romLoaded = true;
+    $('#rom-status').textContent = file.name;
+    log(`ROM loaded: ${file.name} (${(romBytes.byteLength / 1048576).toFixed(1)} MB)`, 'ok');
+    startEmulator();
+});
+
+/* ── Emulator main loop ─────────────────────────────── */
+const imageData = new ImageData(240, 160);
+
+function startEmulator() {
     if (emuRunning) return;
     emuRunning = true;
-    log('Emulator started (placeholder — connect a GBA core for real emulation)');
+    log('Emulator running — mGBA core', 'ok');
 
-    /* Placeholder: draw a gradient frame to show canvas works */
-    function renderFrame() {
+    const targetFps = 59.7275;
+    const frameDuration = 1000 / targetFps;
+    let lastFrameTime = performance.now();
+
+    function tick() {
         if (!emuRunning) return;
-        frameCount++;
 
         const now = performance.now();
+
+        /* Run mGBA for one frame */
+        mgbaSetKeys(currentKeys);
+        mgbaRunFrame();
+
+        /* Blit pixels to canvas */
+        const pixPtr = mgbaGetPixels();
+        if (pixPtr) {
+            const pixels = new Uint8Array(mgba.HEAPU8.buffer, pixPtr, 240 * 160 * 4);
+            imageData.data.set(pixels);
+            ctx.putImageData(imageData, 0, 0);
+        }
+
+        /* FPS counter */
+        frameCount++;
         if (now - lastFpsTime >= 1000) {
             $('#fps-counter').textContent = frameCount;
             frameCount = 0;
             lastFpsTime = now;
         }
 
-        /* Placeholder pixel noise to show the canvas is alive */
-        const img = ctx.createImageData(240, 160);
-        const t = performance.now() / 1000;
-        for (let i = 0; i < img.data.length; i += 4) {
-            const px = (i / 4) % 240;
-            const py = Math.floor((i / 4) / 240);
-            const v = ((Math.sin(px * 0.05 + t) + Math.sin(py * 0.05 + t * 0.7)) * 0.25 + 0.5);
-            img.data[i]   = v * 16;
-            img.data[i+1] = v * 16;
-            img.data[i+2] = v * 24;
-            img.data[i+3] = 255;
-        }
-        ctx.putImageData(img, 0, 0);
-
-        ctx.fillStyle = '#18e0e0';
-        ctx.font = '10px monospace';
-        ctx.fillText('Placeholder renderer — plug in GBA core', 16, 80);
-        ctx.fillText('Netplay framework active', 48, 96);
-
-        requestAnimationFrame(renderFrame);
+        /* Schedule next frame */
+        const elapsed = performance.now() - now;
+        const delay = Math.max(0, frameDuration - elapsed);
+        setTimeout(tick, delay);
     }
-    requestAnimationFrame(renderFrame);
+    tick();
 }
 
-/* ── Key mapping (standard GBA) ──────────────────────── */
+/* ── Key mapping (GBA button bits) ───────────────────── */
+/* mGBA key bits: A=0, B=1, Select=2, Start=3, Right=4, Left=5, Up=6, Down=7, R=8, L=9 */
+const KEY_A      = 1 << 0;
+const KEY_B      = 1 << 1;
+const KEY_SELECT = 1 << 2;
+const KEY_START  = 1 << 3;
+const KEY_RIGHT  = 1 << 4;
+const KEY_LEFT   = 1 << 5;
+const KEY_UP     = 1 << 6;
+const KEY_DOWN   = 1 << 7;
+const KEY_R      = 1 << 8;
+const KEY_L      = 1 << 9;
+
 const keyMap = {
-    'ArrowUp': 'UP', 'ArrowDown': 'DOWN', 'ArrowLeft': 'LEFT', 'ArrowRight': 'RIGHT',
-    'z': 'A', 'x': 'B', 'Enter': 'START', 'Shift': 'SELECT',
-    'a': 'L', 's': 'R',
+    'ArrowUp':    KEY_UP,
+    'ArrowDown':  KEY_DOWN,
+    'ArrowLeft':  KEY_LEFT,
+    'ArrowRight': KEY_RIGHT,
+    'z':          KEY_A,
+    'Z':          KEY_A,
+    'x':          KEY_B,
+    'X':          KEY_B,
+    'Enter':      KEY_START,
+    'Shift':      KEY_SELECT,
+    'a':          KEY_L,
+    'A':          KEY_L,
+    's':          KEY_R,
+    'S':          KEY_R,
 };
-let keysPressed = {};
+let currentKeys = 0;
+
 document.addEventListener('keydown', e => {
-    const k = keyMap[e.key];
-    if (k) { keysPressed[k] = true; e.preventDefault(); }
+    const bit = keyMap[e.key];
+    if (bit !== undefined) {
+        currentKeys |= bit;
+        e.preventDefault();
+    }
 });
 document.addEventListener('keyup', e => {
-    const k = keyMap[e.key];
-    if (k) { keysPressed[k] = false; e.preventDefault(); }
+    const bit = keyMap[e.key];
+    if (bit !== undefined) {
+        currentKeys &= ~bit;
+        e.preventDefault();
+    }
 });
 
 /* ── WebSocket Netplay ───────────────────────────────── */
@@ -319,18 +398,17 @@ function handleServerPacket(pkt) {
 }
 
 function handleRemoteState(pkt) {
-    /* In real integration, update remote player sprite on the GBA screen.
-       For now, just log key changes. */
     if (!localState || pkt.mapGroup !== localState.lastRemoteMap) {
         log(`Remote player on map (${pkt.mapGroup},${pkt.mapNum}) at (${pkt.x},${pkt.y})`);
         if (localState) localState.lastRemoteMap = pkt.mapGroup;
     }
 }
 
-/* Send local state periodically (when real emu is connected) */
+/* Send local state periodically — reads from emulator memory */
 function broadcastLocalState() {
     if (!connected || !emuRunning) return;
-    /* Placeholder — real integration reads from emulator memory */
+    /* pokeemerald gPlayerAvatar + gSaveBlock1Ptr offsets  */
+    /* Placeholder addrs — update with actual symbol offsets */
     wsSend({
         type: 'player_state',
         mapGroup: 0, mapNum: 0,
@@ -338,6 +416,7 @@ function broadcastLocalState() {
         facingDirection: 1,
         movementAction: 0,
         graphicsId: 0,
+        frame: mgbaFrameCounter ? mgbaFrameCounter() : 0,
     });
 }
 setInterval(broadcastLocalState, 250);

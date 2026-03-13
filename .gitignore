@@ -8,6 +8,12 @@ pokeemerald/.git/
 agbcc/
 pokeemerald/tools/agbcc/
 
+# Emscripten SDK (installed separately)
+/emsdk/
+
+# mGBA source (cloned separately)
+/mgba/
+
 # System
 *.pyc
 __pycache__/
